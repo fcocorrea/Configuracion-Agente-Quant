@@ -12,6 +12,7 @@ Sigue este estándar SIEMPRE que generes código MQL5 para MetaTrader 5, salvo i
 1. **Confirmación de volumen**: antes de operar, el volumen (tick volume, `Volume[]` / `iVolume`) de la vela recién cerrada debe ser mayor al promedio de las 20 velas anteriores a ella (no incluye la vela evaluada). Calcular con `CopyTickVolume` o `CopyRealVolume` según el símbolo, sobre el rango `[shift+1, shift+20]`.
 2. **Filtro RSI**: nunca **comprar** si el RSI (handle vía `iRSI`, período configurable, default 14) está en sobrecompra (>70), y nunca **vender** si está en sobreventa (<30) en el momento de la señal. El filtro es direccional: comprar en sobreventa o vender en sobrecompra sí está permitido. Estos niveles deben ser `input` configurables.
 3. **Solo al cierre de vela**: la lógica de entrada/señal se evalúa una única vez por vela nueva, nunca en cada tick. Usar detección de nueva barra vía `iTime(_Symbol, _Period, 0)` comparado contra una variable estática/miembro, NUNCA `IsNewBar()` ad-hoc mal implementado ni time-based polling.
+4. **Una sola operación abierta a la vez**: antes de evaluar o enviar una nueva entrada, verificar que no exista ya una posición abierta (`PositionSelect(_Symbol)` o, si el EA opera multi-símbolo/multi-magic, filtrar por symbol+magic). Si hay una posición abierta, no se evalúa ni envía ninguna orden nueva hasta cerrarla.
 
 ## Arquitectura obligatoria
 
