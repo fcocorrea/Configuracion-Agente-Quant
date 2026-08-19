@@ -1,6 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                                  ea_template.mq5 |
-//|      Plantilla base POO: filtro volumen + RSI + cierre de vela  |
+//|  Plantilla base POO: filtro volumen + RSI + cierre de vela +    |
+//|  gestión de riesgo ATR (SL/TP/break even/trailing, on/off)      |
 //+------------------------------------------------------------------+
 #property copyright "Plantilla EA"
 #property version   "1.00"
@@ -8,17 +9,45 @@
 
 #include <Trade\Trade.mqh>
 
-//--- Inputs generales
-input double InpLots            = 0.10;    // Lotaje fijo (ajustar a gestión de riesgo real)
+//--- Enum de modo de lotaje (usado por el grupo "Lotaje")
+enum ENUM_LOT_MODE
+  {
+   LOT_MODE_FIXED,          // Lotaje fijo
+   LOT_MODE_RISK_PERCENT    // % de riesgo sobre el balance
+  };
+
+input group "General"
 input int    InpMagicNumber     = 123456;  // Magic number
 input int    InpSlippage        = 10;      // Slippage en puntos
-input double InpStopLossPoints  = 500;     // Stop loss en puntos (0 = sin SL)
-input double InpTakeProfitPoints= 1000;    // Take profit en puntos (0 = sin TP)
 
-//--- Inputs filtro volumen
+input group "Lotaje"
+input ENUM_LOT_MODE InpLotMode  = LOT_MODE_FIXED; // Modo de cálculo del lotaje
+input double InpFixedLots       = 0.10;    // Lotaje fijo (usado si InpLotMode = LOT_MODE_FIXED)
+input double InpRiskPercent     = 1.0;     // % de balance a arriesgar por operación (usado si InpLotMode = LOT_MODE_RISK_PERCENT)
+
+input group "ATR"
+input int    InpAtrPeriod       = 14;      // Período ATR
+
+input group "Stop Loss / Take Profit"
+input bool   InpUseStopLoss     = true;    // Activar stop loss
+input double InpSlAtrMultiplier = 2.0;     // Stop loss = ATR x este múltiplo
+input bool   InpUseTakeProfit   = true;    // Activar take profit
+input double InpTpAtrMultiplier = 4.0;     // Take profit = ATR x este múltiplo
+
+input group "Break Even"
+input bool   InpUseBreakEven           = true;  // Activar break even
+input double InpBreakEvenTriggerAtrMul = 1.5;   // ATR x múltiplo de ganancia para activar break even
+input double InpBreakEvenOffsetAtrMul  = 0.2;   // ATR x múltiplo de ganancia asegurado en break even
+
+input group "Trailing Stop"
+input bool   InpUseTrailingStop       = true;   // Activar trailing stop
+input double InpTrailingAtrMultiplier = 2.0;    // Distancia del trailing stop = ATR x este múltiplo
+input double InpTrailingStepAtrMul    = 0.3;    // Paso mínimo para mover el trailing = ATR x este múltiplo
+
+input group "Filtro de Volumen"
 input int    InpVolumePeriod    = 20;      // Velas para el promedio de volumen
 
-//--- Inputs filtro RSI
+input group "Filtro RSI"
 input int    InpRsiPeriod       = 14;      // Período del RSI
 input double InpRsiOverbought   = 70.0;    // Nivel de sobrecompra
 input double InpRsiOversold     = 30.0;    // Nivel de sobreventa
@@ -47,9 +76,55 @@ public:
   };
 
 //+------------------------------------------------------------------+
+//| CAtrProvider: handle único de ATR, fuente de todas las           |
+//| distancias de gestión de riesgo (SL, TP, break even, trailing). |
+//+------------------------------------------------------------------+
+class CAtrProvider
+  {
+private:
+   int               m_handle;
+
+public:
+                     CAtrProvider(void) : m_handle(INVALID_HANDLE) {}
+
+   bool              Init(int period)
+     {
+      m_handle = iATR(_Symbol, _Period, period);
+      if(m_handle == INVALID_HANDLE)
+        {
+         Print(__FUNCTION__, ": no se pudo crear el handle de ATR, code=", GetLastError());
+         return false;
+        }
+      return true;
+     }
+
+   void              Deinit(void)
+     {
+      if(m_handle != INVALID_HANDLE)
+         IndicatorRelease(m_handle);
+     }
+
+   //--- Valor de ATR en la vela shift (0 = vela en formación, 1 = última vela cerrada)
+   bool              GetValue(int shift, double &out)
+     {
+      double buffer[];
+      ArraySetAsSeries(buffer, true);
+
+      if(CopyBuffer(m_handle, 0, shift, 1, buffer) <= 0)
+        {
+         Print(__FUNCTION__, ": error copiando ATR, code=", GetLastError());
+         return false;
+        }
+
+      out = buffer[0];
+      return true;
+     }
+  };
+
+//+------------------------------------------------------------------+
 //| CSignalFilter: filtro obligatorio de volumen + RSI               |
-//| Encapsula las 3 reglas por defecto (volumen, RSI, cierre vela   |
-//| se gestiona vía CBarMonitor desde el EA principal).              |
+//| Encapsula las reglas de volumen/RSI (el cierre de vela se       |
+//| gestiona vía CBarMonitor desde el EA principal).                 |
 //+------------------------------------------------------------------+
 class CSignalFilter
   {
@@ -191,7 +266,183 @@ public:
   };
 
 //+------------------------------------------------------------------+
-//| CExpertAdvisor: orquesta filtros + ejecución con CTrade          |
+//| CRiskManager: break even + trailing stop sobre la posición       |
+//| abierta, en múltiplos de ATR. Corre en cada tick (no solo al     |
+//| cierre de vela): es gestión de riesgo, no señal de entrada/salida.|
+//+------------------------------------------------------------------+
+class CRiskManager
+  {
+private:
+   long              m_magicNumber;
+   bool              m_useBreakEven;
+   double            m_beTriggerAtrMul;
+   double            m_beOffsetAtrMul;
+   bool              m_useTrailing;
+   double            m_trailingAtrMul;
+   double            m_trailingStepAtrMul;
+
+   //--- true si 'candidate' protege más que 'current' (0 = sin SL, cualquier candidate es mejor)
+   bool              IsBetterSL(bool isBuy, double candidate, double current)
+     {
+      if(current == 0.0)
+         return true;
+      return isBuy ? (candidate > current) : (candidate < current);
+     }
+
+public:
+                     CRiskManager(void) : m_magicNumber(0),
+                                           m_useBreakEven(true),
+                                           m_beTriggerAtrMul(0),
+                                           m_beOffsetAtrMul(0),
+                                           m_useTrailing(true),
+                                           m_trailingAtrMul(0),
+                                           m_trailingStepAtrMul(0) {}
+
+   void              Init(long magicNumber,
+                           bool useBreakEven, double beTriggerAtrMul, double beOffsetAtrMul,
+                           bool useTrailing, double trailingAtrMul, double trailingStepAtrMul)
+     {
+      m_magicNumber        = magicNumber;
+      m_useBreakEven        = useBreakEven;
+      m_beTriggerAtrMul     = beTriggerAtrMul;
+      m_beOffsetAtrMul      = beOffsetAtrMul;
+      m_useTrailing         = useTrailing;
+      m_trailingAtrMul      = trailingAtrMul;
+      m_trailingStepAtrMul  = trailingStepAtrMul;
+     }
+
+   //--- Recorre break even y trailing sobre la posición abierta del símbolo/magic actual.
+   //--- 'atr' debe estar inicializado por el EA (mismo handle usado para SL/TP de apertura).
+   void              Manage(CTrade &trade, CAtrProvider &atr)
+     {
+      if(!m_useBreakEven && !m_useTrailing)
+         return;
+
+      if(!PositionSelect(_Symbol))
+         return;
+      if(PositionGetInteger(POSITION_MAGIC) != m_magicNumber)
+         return;
+
+      double atrValue;
+      if(!atr.GetValue(0, atrValue) || atrValue <= 0.0)
+         return;
+
+      bool   isBuy      = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      double openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL  = PositionGetDouble(POSITION_SL);
+      double currentTP  = PositionGetDouble(POSITION_TP);
+      double refPrice   = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                                 : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      double profitDistance = isBuy ? (refPrice - openPrice) : (openPrice - refPrice);
+
+      double newSL = currentSL;
+
+      //--- Break even: asegura 'offset' x ATR de ganancia una vez alcanzado el trigger
+      if(m_useBreakEven && profitDistance >= m_beTriggerAtrMul * atrValue)
+        {
+         double candidate = isBuy ? openPrice + m_beOffsetAtrMul * atrValue
+                                   : openPrice - m_beOffsetAtrMul * atrValue;
+         if(IsBetterSL(isBuy, candidate, newSL))
+            newSL = candidate;
+        }
+
+      //--- Trailing stop: sigue el precio a 'trailingAtrMul' x ATR, respetando el paso mínimo
+      if(m_useTrailing && profitDistance >= m_trailingAtrMul * atrValue)
+        {
+         double candidate = isBuy ? refPrice - m_trailingAtrMul * atrValue
+                                   : refPrice + m_trailingAtrMul * atrValue;
+         double stepThreshold = isBuy ? currentSL + m_trailingStepAtrMul * atrValue
+                                       : currentSL - m_trailingStepAtrMul * atrValue;
+
+         bool passesStep = (currentSL == 0.0) || IsBetterSL(isBuy, candidate, stepThreshold);
+
+         if(passesStep && IsBetterSL(isBuy, candidate, newSL))
+            newSL = candidate;
+        }
+
+      if(newSL != currentSL)
+        {
+         if(!trade.PositionModify(_Symbol, newSL, currentTP))
+           {
+            Print(__FUNCTION__, ": fallo al modificar SL, retcode=", trade.ResultRetcode(),
+                  " desc=", trade.ResultRetcodeDescription());
+           }
+        }
+     }
+  };
+
+//+------------------------------------------------------------------+
+//| CPositionSizer: lotaje fijo o calculado a partir de un % de      |
+//| riesgo sobre el balance y la distancia de SL (en precio).        |
+//+------------------------------------------------------------------+
+class CPositionSizer
+  {
+private:
+   ENUM_LOT_MODE     m_mode;
+   double            m_fixedLots;
+   double            m_riskPercent;
+
+   double            NormalizeLots(double lots)
+     {
+      double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+      double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+      double normalized = MathFloor(lots / lotStep) * lotStep;
+      return MathMax(minLot, MathMin(maxLot, normalized));
+     }
+
+public:
+                     CPositionSizer(void) : m_mode(LOT_MODE_FIXED),
+                                             m_fixedLots(0.10),
+                                             m_riskPercent(1.0) {}
+
+   void              Init(ENUM_LOT_MODE mode, double fixedLots, double riskPercent)
+     {
+      m_mode        = mode;
+      m_fixedLots   = fixedLots;
+      m_riskPercent = riskPercent;
+     }
+
+   //--- 'slDistance' es la distancia de SL en precio (> 0), obligatoria en modo % de riesgo
+   bool              GetLots(double slDistance, double &lotsOut)
+     {
+      if(m_mode == LOT_MODE_FIXED)
+        {
+         lotsOut = NormalizeLots(m_fixedLots);
+         return true;
+        }
+
+      if(slDistance <= 0.0)
+        {
+         Print(__FUNCTION__, ": distancia de SL inválida para calcular lotaje por % de riesgo");
+         return false;
+        }
+
+      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      if(tickSize <= 0.0 || tickValue <= 0.0)
+        {
+         Print(__FUNCTION__, ": tick value/size inválido para el símbolo");
+         return false;
+        }
+
+      double riskMoney  = AccountInfoDouble(ACCOUNT_BALANCE) * (m_riskPercent / 100.0);
+      double lossPerLot = (slDistance / tickSize) * tickValue;
+      if(lossPerLot <= 0.0)
+        {
+         Print(__FUNCTION__, ": no se pudo calcular la pérdida por lote");
+         return false;
+        }
+
+      lotsOut = NormalizeLots(riskMoney / lossPerLot);
+      return true;
+     }
+  };
+
+//+------------------------------------------------------------------+
+//| CExpertAdvisor: orquesta filtros + gestión de riesgo ATR + CTrade|
 //+------------------------------------------------------------------+
 class CExpertAdvisor
   {
@@ -199,10 +450,14 @@ private:
    CTrade            m_trade;
    CBarMonitor       m_barMonitor;
    CSignalFilter     m_filter;
+   CRiskManager      m_riskManager;
+   CAtrProvider      m_atr;
+   CPositionSizer    m_sizer;
 
-   double            m_lots;
-   double            m_slPoints;
-   double            m_tpPoints;
+   bool              m_useSl;
+   double            m_slAtrMul;
+   bool              m_useTp;
+   double            m_tpAtrMul;
 
    bool              OpenPosition(ENUM_ORDER_TYPE orderType)
      {
@@ -210,19 +465,29 @@ private:
                      ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                      : SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      //--- ATR de la última vela cerrada, coherente con la señal evaluada solo al cierre de vela
+      double atrValue;
+      if(!m_atr.GetValue(1, atrValue) || atrValue <= 0.0)
+         return false;
+
+      double slDistance = m_useSl ? m_slAtrMul * atrValue : 0.0;
+
+      double lots;
+      if(!m_sizer.GetLots(slDistance, lots))
+         return false;
+
       double sl = 0.0, tp = 0.0;
 
-      if(m_slPoints > 0)
-         sl = (orderType == ORDER_TYPE_BUY) ? price - m_slPoints * point
-                                             : price + m_slPoints * point;
-      if(m_tpPoints > 0)
-         tp = (orderType == ORDER_TYPE_BUY) ? price + m_tpPoints * point
-                                             : price - m_tpPoints * point;
+      if(m_useSl)
+         sl = (orderType == ORDER_TYPE_BUY) ? price - slDistance
+                                             : price + slDistance;
+      if(m_useTp)
+         tp = (orderType == ORDER_TYPE_BUY) ? price + m_tpAtrMul * atrValue
+                                             : price - m_tpAtrMul * atrValue;
 
       bool result = (orderType == ORDER_TYPE_BUY)
-                    ? m_trade.Buy(m_lots, _Symbol, price, sl, tp)
-                    : m_trade.Sell(m_lots, _Symbol, price, sl, tp);
+                    ? m_trade.Buy(lots, _Symbol, price, sl, tp)
+                    : m_trade.Sell(lots, _Symbol, price, sl, tp);
 
       if(!result)
         {
@@ -234,30 +499,54 @@ private:
      }
 
 public:
-   bool              Init(int magicNumber, int slippage, double lots,
-                           double slPoints, double tpPoints,
+   bool              Init(int magicNumber, int slippage,
+                           ENUM_LOT_MODE lotMode, double fixedLots, double riskPercent,
+                           int atrPeriod,
+                           bool useSl, double slAtrMul, bool useTp, double tpAtrMul,
+                           bool useBreakEven, double beTriggerAtrMul, double beOffsetAtrMul,
+                           bool useTrailing, double trailingAtrMul, double trailingStepAtrMul,
                            int rsiPeriod, double rsiOverbought, double rsiOversold,
                            int volumePeriod)
      {
-      m_lots     = lots;
-      m_slPoints = slPoints;
-      m_tpPoints = tpPoints;
+      //--- El modo % de riesgo necesita una distancia de SL para dimensionar el lotaje
+      if(lotMode == LOT_MODE_RISK_PERCENT && !useSl)
+        {
+         Print(__FUNCTION__, ": InpLotMode = LOT_MODE_RISK_PERCENT requiere InpUseStopLoss = true");
+         return false;
+        }
+
+      m_useSl    = useSl;
+      m_slAtrMul = slAtrMul;
+      m_useTp    = useTp;
+      m_tpAtrMul = tpAtrMul;
 
       m_trade.SetExpertMagicNumber(magicNumber);
       m_trade.SetDeviationInPoints(slippage);
       m_trade.SetTypeFilling(ORDER_FILLING_FOK);
+
+      m_sizer.Init(lotMode, fixedLots, riskPercent);
+
+      if(!m_atr.Init(atrPeriod))
+         return false;
+
+      m_riskManager.Init(magicNumber, useBreakEven, beTriggerAtrMul, beOffsetAtrMul,
+                          useTrailing, trailingAtrMul, trailingStepAtrMul);
 
       return m_filter.Init(rsiPeriod, rsiOverbought, rsiOversold, volumePeriod);
      }
 
    void              Deinit(void)
      {
+      m_atr.Deinit();
       m_filter.Deinit();
      }
 
-   //--- Regla 3: toda la lógica de señal se evalúa una sola vez por vela nueva
+   //--- Regla 3: toda la lógica de señal se evalúa una sola vez por vela nueva.
+   //--- La gestión de riesgo (break even/trailing) corre cada tick, fuera de esa regla.
    void              OnTick(void)
      {
+      m_riskManager.Manage(m_trade, m_atr);
+
       if(!m_barMonitor.IsNewBar())
          return;
 
@@ -283,8 +572,12 @@ CExpertAdvisor g_ea;
 //+------------------------------------------------------------------+
 int OnInit(void)
   {
-   if(!g_ea.Init(InpMagicNumber, InpSlippage, InpLots,
-                  InpStopLossPoints, InpTakeProfitPoints,
+   if(!g_ea.Init(InpMagicNumber, InpSlippage,
+                  InpLotMode, InpFixedLots, InpRiskPercent,
+                  InpAtrPeriod,
+                  InpUseStopLoss, InpSlAtrMultiplier, InpUseTakeProfit, InpTpAtrMultiplier,
+                  InpUseBreakEven, InpBreakEvenTriggerAtrMul, InpBreakEvenOffsetAtrMul,
+                  InpUseTrailingStop, InpTrailingAtrMultiplier, InpTrailingStepAtrMul,
                   InpRsiPeriod, InpRsiOverbought, InpRsiOversold,
                   InpVolumePeriod))
      {
